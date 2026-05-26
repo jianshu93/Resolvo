@@ -1,3 +1,4 @@
+/// DADA2 Needleman-Wunsch alignment and substitution compression.
 //! Needleman-Wunsch alignment and substitution compression.
 //!
 //! Ports `nwalign_endsfree.cpp` and `nwalign_vectorized.cpp`, excluding all
@@ -21,10 +22,7 @@ pub const GAP_GLYPH: u16 = 9999;
 /// Score sentinel for out-of-band DP cells.
 const BAND_SENTINEL: i32 = -9999;
 
-// ---------------------------------------------------------------------------
 // AlignParams
-// ---------------------------------------------------------------------------
-
 /// Parameters controlling alignment method selection in `raw_align`.
 #[derive(Clone, Copy)]
 pub struct AlignParams {
@@ -58,10 +56,8 @@ pub struct VectorizedAlignScores {
     pub band: i32,
 }
 
-// ---------------------------------------------------------------------------
-// AlignBuffers
-// ---------------------------------------------------------------------------
 
+// AlignBuffers
 /// Reusable scratch buffers for alignment. Pass the same instance across many
 /// alignments in a tight loop to avoid re-allocating the DP/traceback matrices.
 ///
@@ -92,7 +88,6 @@ impl AlignBuffers {
     pub fn new() -> Self {
         Self::default()
     }
-
     /// Borrow the most recent alignment output as a pair of slices.
     #[inline]
     pub fn alignment(&self) -> (&[u8], &[u8]) {
@@ -112,10 +107,7 @@ fn reset_buf<T: Copy>(v: &mut Vec<T>, n: usize, val: T) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Private helpers
-// ---------------------------------------------------------------------------
-
 /// Return true if byte `b` encodes a nucleotide (A/C/G/T/N = 1..=5).
 #[inline]
 fn is_nt(b: u8) -> bool {
@@ -224,12 +216,8 @@ fn fill_band_sentinels(
     }
 }
 
-// ---------------------------------------------------------------------------
 // Standard NW alignment (ends-free)
-// ---------------------------------------------------------------------------
-
 /// Banded end-gap-free Needleman-Wunsch alignment.
-///
 /// End gaps (at the beginning/end of either sequence) are free (score 0).
 /// Interior gaps have penalty `gap_p` (should be negative).
 /// `band < 0` disables banding.
@@ -333,12 +321,8 @@ pub fn align_endsfree_with_buf(
     );
 }
 
-// ---------------------------------------------------------------------------
 // Homopolymer-aware end-gap-free NW
-// ---------------------------------------------------------------------------
-
 /// Banded end-gap-free NW with position-specific homopolymer gap penalties.
-///
 /// Gaps inside homopolymer runs (length ≥ 3) use `homo_gap_p` instead of
 /// `gap_p`.  Equivalent to C++ `nwalign_endsfree_homo`.
 #[allow(dead_code)]
@@ -444,10 +428,6 @@ pub fn align_endsfree_homo_with_buf(
     );
 }
 
-// ---------------------------------------------------------------------------
-// Standard (non-ends-free) NW — not used in core DADA2, included for parity
-// ---------------------------------------------------------------------------
-
 /// Standard banded Needleman-Wunsch (edge gaps are penalised).
 /// Not used in the core DADA2 algorithm.  Equivalent to C++ `nwalign`.
 #[allow(dead_code)]
@@ -544,10 +524,8 @@ pub fn align_standard_with_buf(
     );
 }
 
-// ---------------------------------------------------------------------------
-// Gapless alignment
-// ---------------------------------------------------------------------------
 
+// Gapless alignment
 /// Position-by-position alignment without gaps.
 /// Shorter sequence is padded with gaps on the right.
 /// Equivalent to C++ `nwalign_gapless`.
@@ -571,10 +549,7 @@ pub fn align_gapless_with_buf(s1: &[u8], s2: &[u8], buf: &mut AlignBuffers) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Vectorized (diagonal-banded) NW  — port of nwalign_vectorized2
-// ---------------------------------------------------------------------------
-
 /// DP inner loop with `up ≥ left ≥ diag` tie-breaking precedence.
 /// Equivalent to C++ `dploop_vec`.
 #[inline]
@@ -959,12 +934,8 @@ pub fn align_vectorized_with_buf(
     }
 }
 
-// ---------------------------------------------------------------------------
 // Substitution compression
-// ---------------------------------------------------------------------------
-
 /// Convert an alignment pair into a `Sub` (compressed substitution record).
-///
 /// Records substitutions of `al1` relative to `al0`, ignoring positions
 /// where either strand has an N (encoded 5).  `Sub::q0`/`Sub::q1` are left
 /// empty; fill them via `sub_new` if quality scores are needed.
@@ -1026,12 +997,9 @@ pub fn al2subs(al0: &[u8], al1: &[u8]) -> Sub {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Dispatcher and sub_new
-// ---------------------------------------------------------------------------
 
+// Dispatcher and sub_new
 /// Select and run the appropriate alignment for two `Raw` objects.
-///
 /// Returns `None` if k-mer screening determines the sequences are too
 /// dissimilar to be worth aligning (i.e. they will produce a NULL Sub).
 /// Equivalent to C++ `raw_align`.

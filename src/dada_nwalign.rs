@@ -1092,11 +1092,15 @@ pub fn raw_align_with_buf(
         align_gapless_with_buf(&raw1.seq, &raw2.seq, buf);
         return Some(());
     }
-    // Long-read guard: align_vectorized uses i16 DP tables. With the default
-    // DADA2 scoring (match=5, mismatch=-4, gap_p=-8) cumulative scores can
-    // approach ±8·N, so we must fall back to the i32 path before overflow
-    // can distort the optimum. 3500 bp leaves ~10% headroom in i16 range.
-    const VECTORIZED_MAX_LEN: usize = 3500;
+    // Long-read guard: align_vectorized uses i16 DP tables.
+    //
+    // ResolvO's RAD consensus path currently uses conservative scoring through
+    // src/align.rs: match=2, mismatch=-2, gap=-3. With that scoring, an 8000 bp
+    // perfect alignment scores 16,000, safely below i16::MAX.
+    //
+    // DADA2-like scoring with larger magnitudes can require a lower cutoff or
+    // a score-aware guard to avoid i16 saturation.
+    const VECTORIZED_MAX_LEN: usize = 8000;
     let too_long = raw1.len() > VECTORIZED_MAX_LEN || raw2.len() > VECTORIZED_MAX_LEN;
     if p.vectorized && !too_long {
         align_vectorized_with_buf(

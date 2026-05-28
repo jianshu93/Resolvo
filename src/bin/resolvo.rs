@@ -85,6 +85,10 @@ enum Commands {
         #[arg(long, default_value_t = 0.03)] sketch_radius: f64,
         /// Maximum iterations for sketch medoid clustering/preclustering.
         #[arg(long, default_value_t = 8)] sketch_max_iter: usize,
+        /// Ends-free Needleman-Wunsch band radius used during consensus polishing.
+        /// For divergent full-length/operon reads, try 64-128.
+        /// Set to -1 for full unbanded NW.
+        #[arg(long, default_value_t = 64)] align_band: i32,
     },
 }
 
@@ -123,9 +127,12 @@ fn main() -> Result<()> {
             sketch_fallback_exact,
             sketch_radius,
             sketch_max_iter,
+            align_band,
         } => {
             let reads = read_fasta_fastq(&input)?;
-            let consensus = ConsensusParams { k, polish_rounds, ..ConsensusParams::default() };
+            let mut align = resolvo::align::AlignParams::default();
+            align.band = align_band;
+            let consensus = ConsensusParams { k, polish_rounds, align, ..ConsensusParams::default() };
             let fad = FadParams {
                 k,
                 min_count: 1,

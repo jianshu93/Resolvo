@@ -53,14 +53,7 @@ where
             centroids.push(vectors[i].iter().map(|&x| x as f64).collect());
         }
 
-        let k = centroids.len();
-        let (sums, counts) = compute_sums(vectors, &assignments, k, dim);
-        for c in 0..k {
-            if counts[c] > 0 {
-                let inv = 1.0 / counts[c] as f64;
-                centroids[c] = sums[c].iter().map(|x| x * inv).collect();
-            }
-        }
+        recompute_centroids_in_place(vectors, &assignments, &mut centroids, dim);
         if !changed { break; }
     }
 
@@ -106,40 +99,58 @@ where
     (best, best_d)
 }
 
-#[cfg(feature = "parallel")]
-fn compute_sums(vectors: &[Vec<u16>], assignments: &[usize], k: usize, dim: usize) -> (Vec<Vec<f64>>, Vec<usize>) {
-    vectors
-        .par_iter()
-        .zip(assignments.par_iter().copied())
-        .fold(
-            || (vec![vec![0.0; dim]; k], vec![0usize; k]),
-            |mut acc, (v, a)| {
-                acc.1[a] += 1;
-                for j in 0..dim { acc.0[a][j] += v[j] as f64; }
-                acc
-            },
-        )
-        .reduce(
-            || (vec![vec![0.0; dim]; k], vec![0usize; k]),
-            |mut a, b| {
-                for c in 0..k {
-                    a.1[c] += b.1[c];
-                    for j in 0..dim { a.0[c][j] += b.0[c][j]; }
-                }
-                a
-            },
-        )
-}
-
-#[cfg(not(feature = "parallel"))]
-fn compute_sums(vectors: &[Vec<u16>], assignments: &[usize], k: usize, dim: usize) -> (Vec<Vec<f64>>, Vec<usize>) {
-    let mut sums = vec![vec![0.0; dim]; k];
+/// Recompute centroids without allocating any extra `k x dim` buffers.
+///
+/// The old `parallel` version used Rayon `fold`/`reduce` with one full `k x dim`
+/// matrix per worker thread. With many clusters and 4096-dimensional k-mer
+/// vectors, that can allocate tens to hundreds of GB.
+///
+/// This function keeps the same DP-means update rule:
+///
+/// - non-empty clusters are replaced by the arithmetic mean of their members;
+/// - empty clusters keep their previous centroid, matching the old behavior.
+///
+/// The expensive nearest-centroid assignment step is still parallel when the
+/// `parallel` feature is enabled. The centroid recomputation is deliberately
+/// serial and in-place because it is memory-bandwidth bound and should not create
+/// per-thread dense accumulation matrices.
+fn recompute_centroids_in_place(
+    vectors: &[Vec<u16>],
+    assignments: &[usize],
+    centroids: &mut [Vec<f64>],
+    dim: usize,
+) {
+    let k = centroids.len();
     let mut counts = vec![0usize; k];
-    for (v, &a) in vectors.iter().zip(assignments) {
+
+    for &a in assignments {
+        debug_assert!(a < k);
         counts[a] += 1;
-        for j in 0..dim { sums[a][j] += v[j] as f64; }
     }
-    (sums, counts)
+
+    // Only clear centroids for clusters that have members. Empty clusters must
+    // keep their previous centroid to preserve the old DP-means behavior.
+    for (c, centroid) in centroids.iter_mut().enumerate() {
+        if counts[c] > 0 {
+            centroid.fill(0.0);
+        }
+    }
+
+    for (v, &a) in vectors.iter().zip(assignments) {
+        let centroid = &mut centroids[a];
+        for j in 0..dim {
+            centroid[j] += v[j] as f64;
+        }
+    }
+
+    for (c, centroid) in centroids.iter_mut().enumerate() {
+        if counts[c] > 0 {
+            let inv = 1.0 / counts[c] as f64;
+            for x in centroid.iter_mut() {
+                *x *= inv;
+            }
+        }
+    }
 }
 
 pub fn normalized_sqeuclidean_centroid(c: &[f64], v: &[u16], k: usize) -> f64 {

@@ -19,20 +19,24 @@ pub struct AlignParams {
 
 impl Default for AlignParams {
     fn default() -> Self {
-        Self { match_score: 2, mismatch_score: -2, gap_score: -3, band: -1, vectorized: true }
+        Self { match_score: 2, mismatch_score: -2, gap_score: -3, band: 16, vectorized: true }
     }
 }
 
 /// Fast ends-free NW wrapper around the DADA2-rs aligner.
 ///
-/// For <=3500 bp it uses the DADA2-rs SIMD-friendly/vectorized anti-diagonal path.
-/// For longer amplicons it falls back to the scalar i32 ends-free path to avoid
-/// i16 DP saturation, matching the safety logic in DADA2-rs.
+/// Uses a DADA2-style positive band by default (`band = 16`), where a negative
+/// band disables banding. For full-length/operon reads, pass a larger band
+/// through the CLI, e.g. `--align-band 128`.
+///
+/// The SIMD/vectorized anti-diagonal path is allowed up to 8000 bp. This is
+/// safe for the default ResolvO scoring used here: match = 2, mismatch = -2,
+/// gap = -3. A perfect 8000 bp alignment scores 16,000, below i16::MAX.
 pub fn endsfree_nw(reference: &Dna2Bit, query: &Dna2Bit, p: &AlignParams) -> Alignment {
     let s1 = reference.to_dada_encoded();
     let s2 = query.to_dada_encoded();
     let mut buf = AlignBuffers::new();
-    const VECTORIZED_MAX_LEN: usize = 3500;
+    const VECTORIZED_MAX_LEN: usize = 8000;
     if p.vectorized && s1.len() <= VECTORIZED_MAX_LEN && s2.len() <= VECTORIZED_MAX_LEN {
         align_vectorized_with_buf(&s1, &s2, &VectorizedAlignScores {
             match_score: p.match_score as i16,

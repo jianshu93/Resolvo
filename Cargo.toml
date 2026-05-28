@@ -1,10 +1,10 @@
 [package]
 name = "resolvo"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Long-amplicon template recovery from noisy long-read clusters using FAD/RAD"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/your-org/resolvo"
+repository = "https://github.com/jianshu93/Resolvo"
 
 [lib]
 name = "resolvo"

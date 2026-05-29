@@ -13,24 +13,81 @@ pub struct ConsensusParams {
     pub min_base_fraction: f64,
     pub polish_rounds: usize,
     pub align: AlignParams,
+    /// Maximum reads used to build one cluster consensus. Large clusters are deterministically
+    /// downsampled evenly. Final read reassignment still uses all reads.
+    pub max_consensus_reads: usize,
+    /// Maximum candidate reads considered when choosing the centroid/draft.
+    pub max_centroid_candidates: usize,
+    /// Maximum reads used as references for scoring centroid candidates.
+    pub max_centroid_comparisons: usize,
 }
 
 impl Default for ConsensusParams {
     fn default() -> Self {
-        Self { k: 6, min_base_fraction: 0.5, polish_rounds: 1, align: AlignParams::default() }
+        Self {
+            k: 6,
+            min_base_fraction: 0.5,
+            polish_rounds: 1,
+            align: AlignParams::default(),
+            max_consensus_reads: 512,
+            max_centroid_candidates: 64,
+            max_centroid_comparisons: 256,
+        }
     }
 }
 
-pub fn choose_centroid(reads: &[Dna2Bit], k: usize) -> Result<usize> {
+pub fn choose_centroid(reads: &[Dna2Bit], params: &ConsensusParams) -> Result<usize> {
     if reads.len() <= 1 { return Ok(0); }
-    let counts = compute_counts(reads, k)?;
-    let sums = pairwise_distance_sums(&counts, k);
-    let (best, _) = sums
-        .into_iter()
-        .enumerate()
-        .min_by(|a, b| a.1.total_cmp(&b.1))
-        .unwrap_or((0, 0.0));
-    Ok(best)
+
+    // The original implementation did an all-vs-all dense k-mer medoid search inside every
+    // cluster. For large long-amplicon clusters this becomes O(m^2 * 4^k) and can dominate
+    // runtime before any alignment happens. Here we keep the same centroid idea but score a
+    // deterministic, evenly spaced subset of candidates against an evenly spaced subset of reads.
+    let candidate_idx = even_sample_indices(reads.len(), params.max_centroid_candidates.max(1));
+    let comparison_idx = even_sample_indices(reads.len(), params.max_centroid_comparisons.max(1));
+
+    let mut needed = candidate_idx.clone();
+    needed.extend(comparison_idx.iter().copied());
+    needed.sort_unstable();
+    needed.dedup();
+
+    let needed_reads: Vec<Dna2Bit> = needed.iter().map(|&i| reads[i].clone()).collect();
+    let needed_counts = compute_counts(&needed_reads, params.k)?;
+
+    let mut by_original = std::collections::HashMap::with_capacity(needed.len());
+    for (local, &orig) in needed.iter().enumerate() { by_original.insert(orig, local); }
+
+    let mut best_idx = candidate_idx[0];
+    let mut best_sum = f64::INFINITY;
+    for &ci in &candidate_idx {
+        let c_local = by_original[&ci];
+        let ci_counts = &needed_counts[c_local];
+        let mut sum = 0.0;
+        for &ri in &comparison_idx {
+            if ri == ci { continue; }
+            let r_local = by_original[&ri];
+            sum += corrected_kmer_dist_full(ci_counts, &needed_counts[r_local], params.k);
+        }
+        if sum < best_sum {
+            best_sum = sum;
+            best_idx = ci;
+        }
+    }
+    Ok(best_idx)
+}
+
+fn even_sample_indices(n: usize, max_n: usize) -> Vec<usize> {
+    if n == 0 { return Vec::new(); }
+    if n <= max_n { return (0..n).collect(); }
+    if max_n <= 1 { return vec![0]; }
+    (0..max_n)
+        .map(|i| i * (n - 1) / (max_n - 1))
+        .collect()
+}
+
+fn downsample_reads(reads: &[Dna2Bit], max_n: usize) -> Vec<Dna2Bit> {
+    let idx = even_sample_indices(reads.len(), max_n.max(1));
+    idx.into_iter().map(|i| reads[i].clone()).collect()
 }
 
 #[cfg(feature = "parallel")]
@@ -84,9 +141,17 @@ fn pairwise_distance_sums(counts: &[Vec<u16>], k: usize) -> Vec<f64> {
 pub fn consensus_from_cluster(reads: &[Dna2Bit], params: &ConsensusParams) -> Result<Dna2Bit> {
     if reads.is_empty() { return Ok(Dna2Bit::from_codes(&[])); }
     if reads.len() == 1 { return Ok(reads[0].clone()); }
-    let mut reference = reads[choose_centroid(reads, params.k)?].clone();
+    let work_reads;
+    let active_reads: &[Dna2Bit] = if reads.len() > params.max_consensus_reads.max(1) {
+        work_reads = downsample_reads(reads, params.max_consensus_reads.max(1));
+        &work_reads
+    } else {
+        reads
+    };
+
+    let mut reference = active_reads[choose_centroid(active_reads, params)?].clone();
     for _ in 0..params.polish_rounds.max(1) {
-        reference = polish_once(&reference, reads, params)?;
+        reference = polish_once(&reference, active_reads, params)?;
     }
     Ok(reference)
 }

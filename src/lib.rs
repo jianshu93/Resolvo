@@ -5,6 +5,7 @@ pub mod error;
 pub mod io;
 pub mod derep;
 pub mod kmer;
+pub mod logging;
 pub mod parallel;
 pub mod distance;
 pub mod sketch;

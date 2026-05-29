@@ -4,6 +4,7 @@ use resolvo::algorithms::fad::{fad_denoise, FadParams};
 use resolvo::algorithms::rad::{rad_denoise, RadClusterMode, RadParams};
 use resolvo::consensus::ConsensusParams;
 use resolvo::io::{read_fasta_fastq, write_fasta};
+use std::time::Instant;
 
 #[derive(Parser, Debug)]
 #[command(name = "resolvo")]
@@ -69,7 +70,7 @@ enum Commands {
         #[arg(long, default_value_t = 8)] fine_split_min_features: usize,
 
         /// RAD clustering backend. Use exact for validation, sketch-precluster for large full-operon datasets.
-        #[arg(long, value_enum, default_value = "exact")]
+        #[arg(long, value_enum, default_value = "sketch-precluster")]
         cluster_mode: CliRadClusterMode,
         /// Enable OptDens/Bindash sketches for RAD-supported stages.
         #[arg(long, default_value_t = true)] use_sketch: bool,
@@ -85,6 +86,20 @@ enum Commands {
         #[arg(long, default_value_t = 0.03)] sketch_radius: f64,
         /// Maximum iterations for sketch medoid clustering/preclustering.
         #[arg(long, default_value_t = 8)] sketch_max_iter: usize,
+        /// Hard cap on sketch-created bins. Prevents one-read-per-bin explosions.
+        #[arg(long, default_value_t = 4096)] sketch_max_bins: usize,
+        /// Maximum iterations for exact dense DP-means.
+        #[arg(long, default_value_t = 10)] rough_max_iter: usize,
+        /// Maximum iterations for fine-split DP-means.
+        #[arg(long, default_value_t = 10)] fine_split_max_iter: usize,
+        /// Maximum reads used to build a consensus for one cluster.
+        #[arg(long, default_value_t = 512)] max_consensus_reads: usize,
+        /// Maximum candidate reads scored during centroid selection.
+        #[arg(long, default_value_t = 64)] max_centroid_candidates: usize,
+        /// Maximum reads used to score centroid candidates.
+        #[arg(long, default_value_t = 256)] max_centroid_comparisons: usize,
+        /// Print detailed step-level timings and cluster summaries.
+        #[arg(long, default_value_t = false)] verbose: bool,
         /// Ends-free Needleman-Wunsch band radius used during consensus polishing.
         /// For divergent full-length/operon reads, try 64-128.
         /// Set to -1 for full unbanded NW.
@@ -127,12 +142,30 @@ fn main() -> Result<()> {
             sketch_fallback_exact,
             sketch_radius,
             sketch_max_iter,
+            sketch_max_bins,
+            rough_max_iter,
+            fine_split_max_iter,
+            max_consensus_reads,
+            max_centroid_candidates,
+            max_centroid_comparisons,
+            verbose,
             align_band,
         } => {
+            let t0 = Instant::now();
+            if verbose { eprintln!("[resolvo] START read input {input}"); }
             let reads = read_fasta_fastq(&input)?;
+            if verbose { eprintln!("[resolvo] DONE  read input: {} reads in {:.3}s", reads.len(), t0.elapsed().as_secs_f64()); }
             let mut align = resolvo::align::AlignParams::default();
             align.band = align_band;
-            let consensus = ConsensusParams { k, polish_rounds, align, ..ConsensusParams::default() };
+            let consensus = ConsensusParams {
+                k,
+                polish_rounds,
+                align,
+                max_consensus_reads,
+                max_centroid_candidates,
+                max_centroid_comparisons,
+                ..ConsensusParams::default()
+            };
             let fad = FadParams {
                 k,
                 min_count: 1,
@@ -163,13 +196,20 @@ fn main() -> Result<()> {
                 sketch_fallback_exact,
                 sketch_radius,
                 sketch_max_iter,
+                sketch_max_bins,
+                rough_max_iter,
+                fine_split_max_iter,
+                verbose,
                 ..RadParams::default()
             };
             let res = rad_denoise(&reads, &params)?;
             let records = res.templates.iter().enumerate().map(|(i, t)| {
                 (format!("ResolvoRAD_{} cluster_size={} assigned={}", i + 1, t.cluster_size, t.assigned_count), t.seq.clone())
             });
+            if verbose { eprintln!("[resolvo] START write output"); }
+            let tw = Instant::now();
             write_fasta(output, records)?;
+            if verbose { eprintln!("[resolvo] DONE  write output in {:.3}s", tw.elapsed().as_secs_f64()); }
         }
     }
     Ok(())

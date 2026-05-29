@@ -5,6 +5,7 @@ use crate::distance::corrected_kmer_dist_full;
 use crate::dp_means::{dp_means, normalized_sqeuclidean_centroid, DpMeansParams};
 use crate::error::{ResolvoError, Result};
 use crate::kmer::dense_counts;
+use crate::logging::{cluster_summary, log, StageTimer};
 use crate::sketch::{KmerUtilsOptDensSketcher, SketchDistance};
 
 #[cfg(feature = "parallel")]
@@ -80,6 +81,14 @@ pub struct RadParams {
     pub sketch_radius: f64,
     /// Maximum iterations for sketch-only/precluster medoid assignment.
     pub sketch_max_iter: usize,
+    /// Hard cap on sketch-created bins. Prevents pathological one-read-per-bin explosions.
+    pub sketch_max_bins: usize,
+    /// Maximum iterations for exact dense DP-means.
+    pub rough_max_iter: usize,
+    /// Maximum iterations for fine-split projected DP-means.
+    pub fine_split_max_iter: usize,
+    /// Print step-level timing and cluster summaries.
+    pub verbose: bool,
 }
 
 impl Default for RadParams {
@@ -108,6 +117,10 @@ impl Default for RadParams {
             sketch_fallback_exact: true,
             sketch_radius: 0.03,
             sketch_max_iter: 8,
+            sketch_max_bins: 4096,
+            rough_max_iter: 10,
+            fine_split_max_iter: 10,
+            verbose: false,
         }
     }
 }
@@ -138,23 +151,53 @@ pub struct RadResult {
 pub fn rad_denoise(reads: &[ReadRecord], params: &RadParams) -> Result<RadResult> {
     if reads.is_empty() { return Err(ResolvoError::EmptyInput); }
 
+    log(params.verbose, format!(
+        "RAD input reads={} k={} mode={:?} fine_split={} use_sketch={} sketch_size={} align_band={} max_consensus_reads={} rough_max_iter={}",
+        reads.len(),
+        params.k,
+        params.cluster_mode,
+        params.fine_split,
+        params.use_sketch,
+        params.sketch_size,
+        params.consensus.align.band,
+        params.consensus.max_consensus_reads,
+        params.rough_max_iter,
+    ));
+
+    let t = StageTimer::start("compute dense k-mer counts", params.verbose);
     let kmer_vecs = compute_read_counts(reads, params)?;
+    t.done();
+
+    let t = StageTimer::start("compute OptDens sketches", params.verbose);
     let read_sketches = compute_read_sketches(reads, params)?;
+    t.done();
+
+    let t = StageTimer::start("RAD rough clustering", params.verbose);
     let mut clusters = build_clusters(reads, &kmer_vecs, read_sketches.as_deref(), params)?;
+    t.done();
+    log(params.verbose, format!("rough {}", cluster_summary(&clusters)));
 
     if clusters.is_empty() { clusters.push((0..reads.len()).collect()); }
     clusters.retain(|m| m.len() >= params.min_cluster_size);
     if clusters.is_empty() { clusters.push((0..reads.len()).collect()); }
+    log(params.verbose, format!("after min_cluster_size filter {}", cluster_summary(&clusters)));
 
     if params.fine_split {
+        let t = StageTimer::start("RAD recursive high-variance fine splitting", params.verbose);
         clusters = fine_split_clusters(&kmer_vecs, clusters, params)?;
+        t.done();
         clusters.retain(|m| m.len() >= params.min_cluster_size);
         if clusters.is_empty() { clusters.push((0..reads.len()).collect()); }
+        log(params.verbose, format!("fine-split {}", cluster_summary(&clusters)));
     }
 
+    let t = StageTimer::start("consensus templates", params.verbose);
     let mut templates = consensus_templates(reads, &clusters, params)?;
+    t.done();
+    log(params.verbose, format!("consensus templates={}", templates.len()));
 
     if params.run_fad_clean && templates.len() > 1 {
+        let t = StageTimer::start("FAD-clean RAD consensus templates", params.verbose);
         let pseudo: Vec<ReadRecord> = templates
             .iter()
             .enumerate()
@@ -179,10 +222,17 @@ pub fn rad_denoise(reads: &[ReadRecord], params: &RadParams) -> Result<RadResult
             });
         }
         templates = kept;
+        t.done();
+        log(params.verbose, format!("after FAD-clean templates={}", templates.len()));
     }
 
+    let t = StageTimer::start("template k-mer counts", params.verbose);
     let tmpl_counts = compute_template_counts(&templates, params)?;
+    t.done();
+    let t = StageTimer::start("template sketches", params.verbose);
     let tmpl_sketches = compute_template_sketches(&templates, params)?;
+    t.done();
+    let t = StageTimer::start("final read-to-template reassignment", params.verbose);
     let read_assignments = assign_reads_to_templates(
         &kmer_vecs,
         read_sketches.as_deref(),
@@ -190,9 +240,11 @@ pub fn rad_denoise(reads: &[ReadRecord], params: &RadParams) -> Result<RadResult
         tmpl_sketches.as_deref(),
         params,
     );
+    t.done();
     for t in &mut templates { t.assigned_count = 0; }
     for &a in &read_assignments { templates[a].assigned_count += 1; }
 
+    log(params.verbose, format!("RAD done templates={}", templates.len()));
     Ok(RadResult { templates, read_assignments, clusters })
 }
 
@@ -224,7 +276,7 @@ fn build_clusters(
 }
 
 fn exact_dp_clusters(kmer_vecs: &[Vec<u16>], params: &RadParams) -> Result<Vec<Vec<usize>>> {
-    let dp_params = DpMeansParams { radius: params.rough_radius, max_iter: 30 };
+    let dp_params = DpMeansParams { radius: params.rough_radius, max_iter: params.rough_max_iter.max(1) };
     let clusters0 = dp_means(kmer_vecs, &dp_params, |c, v| normalized_sqeuclidean_centroid(c, v, params.k));
     Ok(clusters0.into_iter().map(|c| c.members).collect())
 }
@@ -252,7 +304,7 @@ fn exact_dp_one_bin(kmer_vecs: &[Vec<u16>], bin: Vec<usize>, params: &RadParams)
         return Ok(vec![bin]);
     }
     let local: Vec<Vec<u16>> = bin.iter().map(|&i| kmer_vecs[i].clone()).collect();
-    let dp_params = DpMeansParams { radius: params.rough_radius, max_iter: 30 };
+    let dp_params = DpMeansParams { radius: params.rough_radius, max_iter: params.rough_max_iter.max(1) };
     let local_clusters = dp_means(&local, &dp_params, |c, v| normalized_sqeuclidean_centroid(c, v, params.k));
     let mapped = local_clusters
         .into_iter()
@@ -275,7 +327,7 @@ fn sketch_dp_means(sketches: &[Vec<u16>], params: &RadParams) -> Vec<Vec<usize>>
         let mut new_medoids = Vec::new();
 
         for (i, &(best, best_d)) in nearest.iter().enumerate() {
-            let a = if best_d > params.sketch_radius {
+            let a = if best_d > params.sketch_radius && medoids.len() + new_medoids.len() < params.sketch_max_bins.max(1) {
                 let idx = medoids.len() + new_medoids.len();
                 new_medoids.push(i);
                 idx
@@ -410,7 +462,7 @@ fn fine_split_one_cluster(
         .map(|&idx| features.iter().map(|&f| kmer_vecs[idx][f]).collect())
         .collect();
 
-    let dp_params = DpMeansParams { radius: params.fine_split_radius, max_iter: 30 };
+    let dp_params = DpMeansParams { radius: params.fine_split_radius, max_iter: params.fine_split_max_iter.max(1) };
     let local_clusters = dp_means(&projected, &dp_params, |c, v| normalized_sqeuclidean_projected(c, v, params.k));
 
     let mut mapped: Vec<Vec<usize>> = local_clusters
@@ -705,17 +757,31 @@ fn sketch_candidates(
     top_k: usize,
 ) -> Vec<usize> {
     let dist = SketchDistance::Bindash { k };
-    let mut scored: Vec<(usize, f64)> = tmpl_sketches
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, sig)| {
-            let d = dist.eval(query, sig);
-            if d <= max_dist { Some((idx, d)) } else { None }
-        })
-        .collect();
-    scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-    scored.truncate(top_k.max(1));
-    scored.into_iter().map(|(idx, _)| idx).collect()
+    let kkeep = top_k.max(1).min(tmpl_sketches.len().max(1));
+    let mut best: Vec<(usize, f64)> = Vec::with_capacity(kkeep);
+
+    for (idx, sig) in tmpl_sketches.iter().enumerate() {
+        let d = dist.eval(query, sig);
+        if best.len() < kkeep {
+            best.push((idx, d));
+            if best.len() == kkeep {
+                best.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            }
+        } else if d < best[kkeep - 1].1 {
+            best[kkeep - 1] = (idx, d);
+            best.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        }
+    }
+
+    // Prefer candidates under the user cutoff, but never return an empty candidate list just
+    // because the cutoff was too strict: falling back to all exact template distances is often
+    // the real performance killer for large RAD runs.
+    let under: Vec<usize> = best.iter().filter_map(|&(idx, d)| if d <= max_dist { Some(idx) } else { None }).collect();
+    if under.is_empty() {
+        best.into_iter().map(|(idx, _)| idx).collect()
+    } else {
+        under
+    }
 }
 
 fn nearest_template_from_candidates(kv: &[u16], tmpl_counts: &[Vec<u16>], k: usize, candidates: &[usize]) -> usize {

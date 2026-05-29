@@ -10,6 +10,9 @@ pub struct ReadRecord {
     pub id: String,
     pub seq: Dna2Bit,
     pub qual: Option<Vec<u8>>,
+    /// Number of original reads represented by this record.
+    /// FASTA headers like `>Uniq1;size=48;` set this to 48; ordinary FASTQ records use 1.
+    pub count: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -24,7 +27,7 @@ pub fn dereplicate(reads: &[ReadRecord]) -> Vec<DerepRecord> {
     let mut map: HashMap<Dna2Bit, (u64, Vec<usize>)> = HashMap::new();
     for (i, r) in reads.iter().enumerate() {
         let e = map.entry(r.seq.clone()).or_insert_with(|| (0, Vec::new()));
-        e.0 += 1;
+        e.0 += r.count.max(1);
         e.1.push(i);
     }
     finish_derep_map(map)
@@ -38,7 +41,7 @@ pub fn dereplicate(reads: &[ReadRecord]) -> Vec<DerepRecord> {
         .enumerate()
         .fold(HashMap::new, |mut local: HashMap<Dna2Bit, (u64, Vec<usize>)>, (i, r)| {
             let e = local.entry(r.seq.clone()).or_insert_with(|| (0, Vec::new()));
-            e.0 += 1;
+            e.0 += r.count.max(1);
             e.1.push(i);
             local
         })

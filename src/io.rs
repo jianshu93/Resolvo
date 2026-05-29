@@ -6,6 +6,28 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
+
+fn parse_size_from_header(header: &str) -> u64 {
+    // Supports common dereplicated FASTA headers:
+    //   >Uniq1;size=48;
+    //   >Uniq1 size=48
+    //   >Uniq1;size=48;foo=bar
+    for tok in header.split(|c: char| c == ';' || c.is_ascii_whitespace()) {
+        if let Some(v) = tok.strip_prefix("size=") {
+            if let Ok(n) = v.parse::<u64>() { return n.max(1); }
+        }
+    }
+    1
+}
+
+fn clean_id_from_header(header: &str) -> String {
+    header
+        .split(|c: char| c == ';' || c.is_ascii_whitespace())
+        .next()
+        .unwrap_or(header)
+        .to_string()
+}
+
 fn open_reader<P: AsRef<Path>>(path: P) -> Result<Box<dyn BufRead>> {
     let path_ref = path.as_ref();
     let file = File::open(path_ref)?;
@@ -28,7 +50,9 @@ pub fn read_fasta_fastq<P: AsRef<Path>>(path: P) -> Result<Vec<ReadRecord>> {
 
 fn read_fasta_from_first(mut reader: Box<dyn BufRead>, first: String) -> Result<Vec<ReadRecord>> {
     let mut records = Vec::new();
-    let mut id = first[1..].trim().to_string();
+    let mut header0 = first[1..].trim().to_string();
+    let mut id = clean_id_from_header(&header0);
+    let mut count = parse_size_from_header(&header0);
     let mut seq = Vec::new();
     let mut line = String::new();
     loop {
@@ -38,16 +62,18 @@ fn read_fasta_from_first(mut reader: Box<dyn BufRead>, first: String) -> Result<
         let l = line.trim_end();
         if let Some(rest) = l.strip_prefix('>') {
             if !seq.is_empty() {
-                records.push(ReadRecord { id, seq: Dna2Bit::from_ascii(&seq)?, qual: None });
+                records.push(ReadRecord { id, seq: Dna2Bit::from_ascii(&seq)?, qual: None, count });
                 seq.clear();
             }
-            id = rest.trim().to_string();
+            header0 = rest.trim().to_string();
+            id = clean_id_from_header(&header0);
+            count = parse_size_from_header(&header0);
         } else {
             seq.extend_from_slice(l.as_bytes());
         }
     }
     if !seq.is_empty() {
-        records.push(ReadRecord { id, seq: Dna2Bit::from_ascii(&seq)?, qual: None });
+        records.push(ReadRecord { id, seq: Dna2Bit::from_ascii(&seq)?, qual: None, count });
     }
     Ok(records)
 }
@@ -65,7 +91,7 @@ fn read_fastq_from_first(mut reader: Box<dyn BufRead>, first: String) -> Result<
         reader.read_line(&mut plus)?;
         reader.read_line(&mut qual)?;
         let qual_vec = qual.trim_end().as_bytes().to_vec();
-        records.push(ReadRecord { id, seq: Dna2Bit::from_ascii(seq.trim_end().as_bytes())?, qual: Some(qual_vec) });
+        records.push(ReadRecord { id, seq: Dna2Bit::from_ascii(seq.trim_end().as_bytes())?, qual: Some(qual_vec), count: 1 });
         header.clear();
         if reader.read_line(&mut header)? == 0 { break; }
     }

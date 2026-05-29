@@ -25,7 +25,7 @@ pub enum RadClusterMode {
 }
 
 impl Default for RadClusterMode {
-    fn default() -> Self { Self::Exact }
+    fn default() -> Self { Self::SketchPreclusterThenExact }
 }
 
 impl std::str::FromStr for RadClusterMode {
@@ -47,6 +47,9 @@ impl std::str::FromStr for RadClusterMode {
 pub struct RadParams {
     pub k: usize,
     pub rough_radius: f64,
+    /// Minimum total abundance/support required to keep a cluster.
+    /// For dereplicated FASTA, this uses `size=` counts, not unique-record count.
+    /// Set to 1 to preserve singleton unique reads through RAD.
     pub min_cluster_size: usize,
     pub consensus: ConsensusParams,
     pub run_fad_clean: bool,
@@ -100,7 +103,7 @@ impl Default for RadParams {
         Self {
             k,
             rough_radius: 0.01,
-            min_cluster_size: 5,
+            min_cluster_size: 1,
             consensus: ConsensusParams { k, ..ConsensusParams::default() },
             run_fad_clean: true,
             fad: FadParams { k, min_count: 1, neighbor_threshold: 1.0, ..FadParams::default() },
@@ -112,7 +115,7 @@ impl Default for RadParams {
             fine_split_radius: 0.01,
             fine_split_min_features: 8,
             fine_split_drop_homopolymer_kmers: true,
-            cluster_mode: RadClusterMode::Exact,
+            cluster_mode: RadClusterMode::SketchPreclusterThenExact,
             use_sketch: true,
             sketch_size: 512,
             sketch_prefilter_threshold: 0.03,
@@ -142,6 +145,39 @@ pub struct RadResult {
     pub clusters: Vec<Vec<usize>>,
 }
 
+
+fn total_input_abundance(reads: &[ReadRecord]) -> u64 {
+    reads.iter().map(|r| r.count.max(1)).sum()
+}
+
+fn cluster_abundance(reads: &[ReadRecord], members: &[usize]) -> u64 {
+    members.iter().map(|&i| reads[i].count.max(1)).sum()
+}
+
+fn retain_clusters_by_abundance(reads: &[ReadRecord], clusters: &mut Vec<Vec<usize>>, min_abundance: u64) {
+    clusters.retain(|m| cluster_abundance(reads, m) >= min_abundance);
+}
+
+fn abundance_cluster_summary(reads: &[ReadRecord], clusters: &[Vec<usize>]) -> String {
+    if clusters.is_empty() {
+        return "clusters=0 records=0 abundance=0".to_string();
+    }
+    let mut sizes: Vec<usize> = clusters.iter().map(|c| c.len()).collect();
+    let mut abund: Vec<u64> = clusters.iter().map(|c| cluster_abundance(reads, c)).collect();
+    sizes.sort_unstable();
+    abund.sort_unstable();
+    let records: usize = sizes.iter().sum();
+    let abundance: u64 = abund.iter().sum();
+    let q = |v: &[usize], p: f64| -> usize { v[((v.len() - 1) as f64 * p).round() as usize] };
+    let qa = |v: &[u64], p: f64| -> u64 { v[((v.len() - 1) as f64 * p).round() as usize] };
+    format!(
+        "clusters={} records={} abundance={} record_size[min={},p50={},p90={},p99={},max={}] abundance[min={},p50={},p90={},p99={},max={}]",
+        clusters.len(), records, abundance,
+        sizes[0], q(&sizes, 0.50), q(&sizes, 0.90), q(&sizes, 0.99), sizes[sizes.len()-1],
+        abund[0], qa(&abund, 0.50), qa(&abund, 0.90), qa(&abund, 0.99), abund[abund.len()-1],
+    )
+}
+
 /// RAD: k-mer-space clustering + consensus per cluster + optional FAD-clean.
 ///
 /// Clustering modes:
@@ -155,8 +191,9 @@ pub fn rad_denoise(reads: &[ReadRecord], params: &RadParams) -> Result<RadResult
     if reads.is_empty() { return Err(ResolvoError::EmptyInput); }
 
     log(params.verbose, format!(
-        "RAD input reads={} k={} mode={:?} fine_split={} use_sketch={} sketch_size={} align_band={} max_consensus_reads={} rough_max_iter={}",
+        "RAD input records={} total_abundance={} k={} mode={:?} fine_split={} use_sketch={} sketch_size={} align_band={} max_consensus_reads={} rough_max_iter={}",
         reads.len(),
+        total_input_abundance(reads),
         params.k,
         params.cluster_mode,
         params.fine_split,
@@ -178,20 +215,20 @@ pub fn rad_denoise(reads: &[ReadRecord], params: &RadParams) -> Result<RadResult
     let t = StageTimer::start("RAD rough clustering", params.verbose);
     let mut clusters = build_clusters(reads, &kmer_vecs, read_sketches.as_deref(), params)?;
     t.done();
-    log(params.verbose, format!("rough {}", cluster_summary(&clusters)));
+    log(params.verbose, format!("rough {}", abundance_cluster_summary(reads, &clusters)));
 
     if clusters.is_empty() { clusters.push((0..reads.len()).collect()); }
-    clusters.retain(|m| m.len() >= params.min_cluster_size);
+    retain_clusters_by_abundance(reads, &mut clusters, params.min_cluster_size as u64);
     if clusters.is_empty() { clusters.push((0..reads.len()).collect()); }
-    log(params.verbose, format!("after min_cluster_size filter {}", cluster_summary(&clusters)));
+    log(params.verbose, format!("after min_cluster_size/support filter {}", abundance_cluster_summary(reads, &clusters)));
 
     if params.fine_split {
         let t = StageTimer::start("RAD recursive high-variance fine splitting", params.verbose);
         clusters = fine_split_clusters(&kmer_vecs, clusters, params)?;
         t.done();
-        clusters.retain(|m| m.len() >= params.min_cluster_size);
+        retain_clusters_by_abundance(reads, &mut clusters, params.min_cluster_size as u64);
         if clusters.is_empty() { clusters.push((0..reads.len()).collect()); }
-        log(params.verbose, format!("fine-split {}", cluster_summary(&clusters)));
+        log(params.verbose, format!("fine-split {}", abundance_cluster_summary(reads, &clusters)));
     }
 
     let t = StageTimer::start("consensus templates", params.verbose);
@@ -204,7 +241,7 @@ pub fn rad_denoise(reads: &[ReadRecord], params: &RadParams) -> Result<RadResult
         let pseudo: Vec<ReadRecord> = templates
             .iter()
             .enumerate()
-            .map(|(i, t)| ReadRecord { id: format!("rad_consensus_{i}"), seq: t.seq.clone(), qual: None })
+            .map(|(i, t)| ReadRecord { id: format!("rad_consensus_{i}"), seq: t.seq.clone(), qual: None, count: t.cluster_size as u64 })
             .collect();
 
         let mut fad_params = params.fad.clone();
@@ -245,7 +282,7 @@ pub fn rad_denoise(reads: &[ReadRecord], params: &RadParams) -> Result<RadResult
     );
     t.done();
     for t in &mut templates { t.assigned_count = 0; }
-    for &a in &read_assignments { templates[a].assigned_count += 1; }
+    for (i, &a) in read_assignments.iter().enumerate() { templates[a].assigned_count += reads[i].count.max(1) as usize; }
 
     log(params.verbose, format!("RAD done templates={}", templates.len()));
     Ok(RadResult { templates, read_assignments, clusters })
@@ -659,7 +696,7 @@ fn consensus_templates(reads: &[ReadRecord], clusters: &[Vec<usize>], params: &R
         .map(|members| {
             let cluster_reads: Vec<_> = members.iter().map(|&i| reads[i].seq.clone()).collect();
             let seq = consensus_from_cluster(&cluster_reads, &params.consensus)?;
-            Ok(RadTemplate { seq, cluster_size: members.len(), assigned_count: 0 })
+            Ok(RadTemplate { seq, cluster_size: cluster_abundance(reads, members) as usize, assigned_count: 0 })
         })
         .collect()
 }
@@ -671,7 +708,7 @@ fn consensus_templates(reads: &[ReadRecord], clusters: &[Vec<usize>], params: &R
         .map(|members| {
             let cluster_reads: Vec<_> = members.iter().map(|&i| reads[i].seq.clone()).collect();
             let seq = consensus_from_cluster(&cluster_reads, &params.consensus)?;
-            Ok(RadTemplate { seq, cluster_size: members.len(), assigned_count: 0 })
+            Ok(RadTemplate { seq, cluster_size: cluster_abundance(reads, members) as usize, assigned_count: 0 })
         })
         .collect()
 }

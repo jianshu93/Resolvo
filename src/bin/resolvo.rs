@@ -53,7 +53,9 @@ enum Commands {
         #[arg(short, long)] output: String,
         #[arg(long, default_value_t = 6)] k: usize,
         #[arg(long, default_value_t = 0.01)] rough_radius: f64,
-        #[arg(long, default_value_t = 5)] min_cluster_size: usize,
+        /// Minimum total abundance/support for retaining a RAD cluster. For dereplicated FASTA, this uses size= counts, not unique-record count.
+        /// Default 1 keeps singleton unique reads/templates through RAD.
+        #[arg(long, default_value_t = 1)] min_cluster_size: usize,
         #[arg(long, default_value_t = 1)] polish_rounds: usize,
         #[arg(long, default_value_t = true)] fad_clean: bool,
         /// Enable recursive high-variance k-mer fine splitting inside rough RAD clusters.
@@ -154,7 +156,10 @@ fn main() -> Result<()> {
             let t0 = Instant::now();
             if verbose { eprintln!("[resolvo] START read input {input}"); }
             let reads = read_fasta_fastq(&input)?;
-            if verbose { eprintln!("[resolvo] DONE  read input: {} reads in {:.3}s", reads.len(), t0.elapsed().as_secs_f64()); }
+            if verbose {
+                let total_abundance: u64 = reads.iter().map(|r| r.count.max(1)).sum();
+                eprintln!("[resolvo] DONE  read input: {} records total_abundance={} in {:.3}s", reads.len(), total_abundance, t0.elapsed().as_secs_f64());
+            }
             let mut align = resolvo::align::AlignParams::default();
             align.band = align_band;
             let consensus = ConsensusParams {
@@ -204,7 +209,7 @@ fn main() -> Result<()> {
             };
             let res = rad_denoise(&reads, &params)?;
             let records = res.templates.iter().enumerate().map(|(i, t)| {
-                (format!("ResolvoRAD_{} cluster_size={} assigned={}", i + 1, t.cluster_size, t.assigned_count), t.seq.clone())
+                (format!("ResolvoRAD_{} support={} assigned={}", i + 1, t.cluster_size, t.assigned_count), t.seq.clone())
             });
             if verbose { eprintln!("[resolvo] START write output"); }
             let tw = Instant::now();

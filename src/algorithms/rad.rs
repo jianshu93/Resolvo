@@ -7,6 +7,9 @@ use crate::error::{ResolvoError, Result};
 use crate::kmer::dense_counts;
 use crate::logging::{cluster_summary, log, StageTimer};
 use crate::sketch::{KmerUtilsOptDensSketcher, SketchDistance};
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::collections::hash_map::DefaultHasher;
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
@@ -261,8 +264,14 @@ fn build_clusters(
                 return exact_dp_clusters(kmer_vecs, params);
             }
             let sketches = sketches.ok_or_else(|| ResolvoError::InvalidParam("sketch precluster requested but sketches are unavailable".into()))?;
-            let bins = sketch_dp_means(sketches, params);
-            exact_dp_within_bins(kmer_vecs, bins, params)
+            let t = StageTimer::start("sketch LSH pre-binning", params.verbose);
+            let bins = sketch_lsh_bins(sketches, params);
+            t.done();
+            log(params.verbose, format!("sketch bins {}", cluster_summary(&bins)));
+            let t = StageTimer::start("exact dense DP-means inside sketch bins", params.verbose);
+            let out = exact_dp_within_bins(kmer_vecs, bins, params);
+            t.done();
+            out
         }
         RadClusterMode::SketchOnly => {
             if !params.use_sketch {
@@ -270,7 +279,7 @@ fn build_clusters(
             }
             let sketches = sketches.ok_or_else(|| ResolvoError::InvalidParam("sketch-only clustering requested but sketches are unavailable".into()))?;
             let _ = reads; // keep signature symmetric; future versions may use read lengths/ids here.
-            Ok(sketch_dp_means(sketches, params))
+            Ok(sketch_lsh_bins(sketches, params))
         }
     }
 }
@@ -313,110 +322,123 @@ fn exact_dp_one_bin(kmer_vecs: &[Vec<u16>], bin: Vec<usize>, params: &RadParams)
     Ok(mapped)
 }
 
-/// Sketch medoid DP-means. This is a rough clustering/preclustering method, not a replacement
-/// for exact dense-kmer RAD unless `cluster_mode = SketchOnly` is explicitly selected.
-fn sketch_dp_means(sketches: &[Vec<u16>], params: &RadParams) -> Vec<Vec<usize>> {
+
+/// Fast sketch pre-binning using OptDens/Bindash signatures.
+///
+/// The previous version used medoid DP-means over sketches. That still required
+/// comparing every read to a growing set of medoids and can be very slow for
+/// 100k+ full-operon reads. This routine is intentionally linear-ish:
+///
+/// - hash several small bands of each 16-bit OptDens signature;
+/// - assign each read to the least-occupied deterministic band bucket;
+/// - split any oversized bucket deterministically by additional sketch positions.
+///
+/// These bins are only rough preclusters. In `SketchPreclusterThenExact` mode,
+/// exact dense-kmer DP-means still runs inside each bin, and final reassignment
+/// is global. Therefore this stage should be fast and high-throughput rather than
+/// an expensive final clustering decision.
+fn sketch_lsh_bins(sketches: &[Vec<u16>], params: &RadParams) -> Vec<Vec<usize>> {
     if sketches.is_empty() { return Vec::new(); }
-    let dist = SketchDistance::Bindash { k: params.k };
-    let mut medoids = vec![0usize];
-    let mut assignments = vec![usize::MAX; sketches.len()];
+    let n = sketches.len();
+    let sig_len = sketches[0].len().max(1);
+    let band_width = 4usize.min(sig_len).max(1);
+    let n_bands = (sig_len / band_width).clamp(1, 16);
+    let max_bin_size = rough_max_bin_size(n, params);
 
-    for _ in 0..params.sketch_max_iter.max(1) {
-        let nearest = assign_all_sketches(sketches, &medoids, dist);
-        let mut changed = false;
-        let mut new_medoids = Vec::new();
+    let mut occupancy: HashMap<u64, usize> = HashMap::with_capacity(n.saturating_mul(2).min(1_000_000));
+    let mut chosen_keys = Vec::with_capacity(n);
 
-        for (i, &(best, best_d)) in nearest.iter().enumerate() {
-            let a = if best_d > params.sketch_radius && medoids.len() + new_medoids.len() < params.sketch_max_bins.max(1) {
-                let idx = medoids.len() + new_medoids.len();
-                new_medoids.push(i);
-                idx
-            } else {
-                best
-            };
-            if assignments[i] != a { changed = true; }
-            assignments[i] = a;
+    for (i, sig) in sketches.iter().enumerate() {
+        let mut best_key = 0u64;
+        let mut best_occ = usize::MAX;
+        for b in 0..n_bands {
+            let key = sketch_band_key(sig, b, band_width, i % 17);
+            let occ = *occupancy.get(&key).unwrap_or(&0);
+            if occ < best_occ || (occ == best_occ && key < best_key) {
+                best_occ = occ;
+                best_key = key;
+            }
         }
-        medoids.extend(new_medoids);
-
-        let mut members = vec![Vec::new(); medoids.len()];
-        for (i, &a) in assignments.iter().enumerate() {
-            if a < members.len() { members[a].push(i); }
-        }
-        recompute_medoids(sketches, &members, &mut medoids, dist);
-
-        if !changed { break; }
+        *occupancy.entry(best_key).or_insert(0) += 1;
+        chosen_keys.push(best_key);
     }
 
-    let mut members = vec![Vec::new(); medoids.len()];
-    for (i, &a) in assignments.iter().enumerate() {
-        if a < members.len() { members[a].push(i); }
+    let mut buckets: HashMap<u64, Vec<usize>> = HashMap::with_capacity(occupancy.len());
+    for (i, key) in chosen_keys.into_iter().enumerate() {
+        buckets.entry(key).or_default().push(i);
     }
-    members.into_iter().filter(|m| !m.is_empty()).collect()
+
+    let mut bins = Vec::new();
+    for (_key, bucket) in buckets {
+        split_oversized_sketch_bucket(sketches, bucket, max_bin_size, &mut bins);
+    }
+
+    bins.retain(|b| !b.is_empty());
+    bins
 }
 
-#[cfg(feature = "parallel")]
-fn assign_all_sketches(sketches: &[Vec<u16>], medoids: &[usize], dist: SketchDistance) -> Vec<(usize, f64)> {
-    sketches
-        .par_iter()
-        .map(|s| nearest_medoid(s, sketches, medoids, dist))
-        .collect()
+fn rough_max_bin_size(n: usize, params: &RadParams) -> usize {
+    // Keep exact dense DP-means inside bins bounded. Larger bins can still be
+    // expensive because exact DP-means is O(reads × centroids × 4^k).
+    // Use sketch_max_bins as a user-facing control over rough granularity: more
+    // bins -> smaller target bin size.
+    let target_from_bins = (n / params.sketch_max_bins.max(1)).max(params.min_cluster_size.max(16));
+    target_from_bins.clamp(256, 2048)
 }
 
-#[cfg(not(feature = "parallel"))]
-fn assign_all_sketches(sketches: &[Vec<u16>], medoids: &[usize], dist: SketchDistance) -> Vec<(usize, f64)> {
-    sketches.iter().map(|s| nearest_medoid(s, sketches, medoids, dist)).collect()
-}
+fn split_oversized_sketch_bucket(
+    sketches: &[Vec<u16>],
+    bucket: Vec<usize>,
+    max_bin_size: usize,
+    out: &mut Vec<Vec<usize>>,
+) {
+    if bucket.len() <= max_bin_size {
+        out.push(bucket);
+        return;
+    }
 
-fn nearest_medoid(query: &[u16], sketches: &[Vec<u16>], medoids: &[usize], dist: SketchDistance) -> (usize, f64) {
-    let mut best_cluster = 0usize;
-    let mut best_d = f64::INFINITY;
-    for (cidx, &midx) in medoids.iter().enumerate() {
-        let d = dist.eval(query, &sketches[midx]);
-        if d < best_d {
-            best_d = d;
-            best_cluster = cidx;
+    let sig_len = sketches[0].len().max(1);
+    let mut sub: HashMap<u64, Vec<usize>> = HashMap::new();
+    for &idx in &bucket {
+        let sig = &sketches[idx];
+        let key = sketch_secondary_key(sig, idx, sig_len);
+        sub.entry(key).or_default().push(idx);
+    }
+
+    for (_k, mut b) in sub {
+        if b.len() <= max_bin_size {
+            out.push(b);
+        } else {
+            // Last-resort deterministic chunking. This is only a pre-binning
+            // accelerator; global FAD-clean and final reassignment can still
+            // collapse/reassign templates after consensus.
+            b.sort_unstable();
+            for chunk in b.chunks(max_bin_size) {
+                out.push(chunk.to_vec());
+            }
         }
     }
-    (best_cluster, best_d)
 }
 
-#[cfg(feature = "parallel")]
-fn recompute_medoids(sketches: &[Vec<u16>], members: &[Vec<usize>], medoids: &mut [usize], dist: SketchDistance) {
-    let new_medoids: Vec<usize> = members
-        .par_iter()
-        .enumerate()
-        .map(|(cidx, m)| best_medoid_for_cluster(sketches, m, medoids[cidx], dist))
-        .collect();
-    for (m, new_m) in medoids.iter_mut().zip(new_medoids) { *m = new_m; }
-}
-
-#[cfg(not(feature = "parallel"))]
-fn recompute_medoids(sketches: &[Vec<u16>], members: &[Vec<usize>], medoids: &mut [usize], dist: SketchDistance) {
-    for (cidx, m) in members.iter().enumerate() {
-        medoids[cidx] = best_medoid_for_cluster(sketches, m, medoids[cidx], dist);
+fn sketch_band_key(sig: &[u16], band: usize, width: usize, salt: usize) -> u64 {
+    let mut h = DefaultHasher::new();
+    band.hash(&mut h);
+    salt.hash(&mut h);
+    let start = (band * width) % sig.len().max(1);
+    for j in 0..width {
+        sig[(start + j) % sig.len()].hash(&mut h);
     }
+    h.finish()
 }
 
-fn best_medoid_for_cluster(sketches: &[Vec<u16>], members: &[usize], fallback: usize, dist: SketchDistance) -> usize {
-    if members.is_empty() { return fallback; }
-    // Full medoid search is O(m^2). Cap to a representative prefix for very large bins; this
-    // keeps rough sketch preclustering cheap. Exact DP-means/consensus follows later.
-    let sample_len = members.len().min(256);
-    let sample = &members[..sample_len];
-    let mut best = members[0];
-    let mut best_sum = f64::INFINITY;
-    for &candidate in sample {
-        let mut sum = 0.0;
-        for &other in sample {
-            sum += dist.eval(&sketches[candidate], &sketches[other]);
-        }
-        if sum < best_sum {
-            best_sum = sum;
-            best = candidate;
-        }
+fn sketch_secondary_key(sig: &[u16], idx: usize, sig_len: usize) -> u64 {
+    let mut h = DefaultHasher::new();
+    0x9e3779b97f4a7c15u64.hash(&mut h);
+    // Spread probes across the signature; use only a few positions to keep this cheap.
+    for m in [0usize, 7, 17, 31, 53, 97, 193, 389] {
+        sig[(idx.wrapping_mul(131).wrapping_add(m)) % sig_len].hash(&mut h);
     }
-    best
+    h.finish()
 }
 
 
